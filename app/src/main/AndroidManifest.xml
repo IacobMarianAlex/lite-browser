@@ -35,6 +35,11 @@
         </activity>
 
         <service
+            android:name=".MediaService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <service
             android:name=".KeepAliveService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />

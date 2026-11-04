@@ -10,8 +10,17 @@ android {
         applicationId 'ro.lite.browser'
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName '1.0'
+        versionCode 3
+        versionName '1.2'
+    }
+
+    signingConfigs {
+        lite {
+            storeFile file('litebrowser.jks')
+            storePassword 'litebrowser'
+            keyAlias 'lite'
+            keyPassword 'litebrowser'
+        }
     }
 
     buildTypes {
@@ -19,8 +28,8 @@ android {
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
-            // semnat cu cheia de debug ca sa se poata instala direct
-            signingConfig signingConfigs.debug
+            // cheie fixa: actualizarile se instaleaza peste versiunea veche, fara sa pierzi login-urile
+            signingConfig signingConfigs.lite
         }
     }
 

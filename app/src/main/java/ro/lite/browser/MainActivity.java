@@ -34,6 +34,7 @@ import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -49,6 +50,7 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.ByteArrayInputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
@@ -74,6 +76,7 @@ public class MainActivity extends Activity {
             {"Instagram", "https://www.instagram.com/", "#E1306C", "0"},
             {"TikTok", "https://www.tiktok.com/", "#161616", "0"},
             {"Messenger", "https://www.messenger.com/", "#0084FF", "1"},
+            {"YouTube", "https://m.youtube.com/", "#FF0000", "0"},
     };
 
     private static final String BG = "#121212";
@@ -86,6 +89,52 @@ public class MainActivity extends Activity {
         boolean desktop;
         WebView wv;          // null = tab adormit
         long lastUsed;
+        boolean injected;    // addon-urile au fost aplicate pe pagina curenta
+        boolean appMode;     // deschis de pe pagina de start: arata ca o aplicatie, fara bara de adrese
+    }
+
+    private AddonManager addons;
+
+    // ---- player media in fundal
+    static java.lang.ref.WeakReference<MainActivity> ref;
+    private boolean bgMedia = true;       // optiunea "Player media in fundal"
+    private Tab mediaTab;                  // tabul care reda sunet acum
+    private boolean mediaServiceOn = false;
+
+    /** Scriptul care urmareste clipurile/sunetele de pe pagina si le raporteaza aplicatiei. */
+    private static final String MEDIA_JS =
+            "(function(){if(window.__lbMedia)return;window.__lbMedia=1;"
+            // pagina crede ca e mereu vizibila, ca sa nu opreasca sunetul cand stingi ecranul
+            + "try{Object.defineProperty(document,'hidden',{get:function(){return false;}});"
+            + "Object.defineProperty(document,'visibilityState',{get:function(){return 'visible';}});}catch(e){}"
+            + "document.addEventListener('visibilitychange',function(e){e.stopImmediatePropagation();},true);"
+            + "function ttl(){try{var m=navigator.mediaSession&&navigator.mediaSession.metadata;"
+            + "if(m&&m.title)return m.title+(m.artist?' – '+m.artist:'');}catch(e){}"
+            + "return document.title||location.hostname;}"
+            + "function rep(e){var el=e.target;if(!el||!el.tagName)return;var tg=el.tagName;"
+            + "if(tg!=='VIDEO'&&tg!=='AUDIO')return;"
+            + "if(e.type==='pause'||e.type==='ended'){if(window.__lbEl===el)LiteMedia.state(false,ttl());return;}"
+            // doar media cu sunet: clipurile mute din feed nu pornesc playerul
+            + "if(!el.paused&&!el.muted&&el.volume>0){window.__lbEl=el;LiteMedia.state(true,ttl());}}"
+            + "['play','playing','pause','ended','volumechange'].forEach(function(n){"
+            + "document.addEventListener(n,rep,true);});"
+            + "window.__lbToggle=function(){var el=window.__lbEl;if(!el)return;if(el.paused)el.play();else el.pause();};"
+            + "window.__lbPlay=function(){var el=window.__lbEl;if(el)el.play();};"
+            + "window.__lbPause=function(){var el=window.__lbEl;if(el)el.pause();};"
+            + "})();";
+
+    /** Legatura dintre pagina si aplicatie (doar raporteaza starea redarii). */
+    private class MediaBridge {
+        private final Tab tab;
+
+        MediaBridge(Tab t) {
+            tab = t;
+        }
+
+        @android.webkit.JavascriptInterface
+        public void state(boolean playing, String title) {
+            runOnUiThread(() -> onMediaState(tab, playing, title));
+        }
     }
 
     private final List<Tab> tabs = new ArrayList<>();
@@ -100,6 +149,9 @@ public class MainActivity extends Activity {
     private TextView tabsBtn;
     private TextView ramLabel;
     private ProgressBar progress;
+    private LinearLayout topBar;
+    private TextView fab;                  // butonul mic din modul aplicatie
+    private boolean barForced = false;     // bara aratata manual in modul aplicatie
 
     private String mobileUA;
     private String desktopUA;
@@ -119,6 +171,9 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences("lite", MODE_PRIVATE);
         maxLive = prefs.getInt("maxLive", 3);
         keepAlive = prefs.getBoolean("keepAlive", false);
+        addons = new AddonManager(prefs);
+        bgMedia = prefs.getBoolean("bgMedia", true);
+        ref = new java.lang.ref.WeakReference<>(this);
 
         getWindow().setStatusBarColor(Color.parseColor(BG));
         getWindow().setNavigationBarColor(Color.parseColor(BG));
@@ -159,10 +214,13 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         handler.removeCallbacks(ramTicker);
-        if (!keepAlive) {
+        // daca se reda ceva cu sunet, lasam pagina sa ruleze (redare cu ecranul stins)
+        if (!keepAlive && mediaTab == null) {
             if (current != null && current.wv != null) current.wv.onPause();
             WebView any = anyLiveWebView();
             if (any != null) any.pauseTimers();
+        } else if (!keepAlive && current != null && current != mediaTab && current.wv != null) {
+            current.wv.onPause();
         }
         saveTabs();
         CookieManager.getInstance().flush();
@@ -184,6 +242,8 @@ public class MainActivity extends Activity {
         saveTabs();
         CookieManager.getInstance().flush();
         for (Tab t : tabs) sleep(t);
+        if (mediaServiceOn) stopService(new Intent(this, MediaService.class));
+        if (ref != null && ref.get() == this) ref = null;
         super.onDestroy();
     }
 
@@ -246,6 +306,7 @@ public class MainActivity extends Activity {
         root.setBackgroundColor(Color.parseColor(BG));
 
         LinearLayout bar = new LinearLayout(this);
+        topBar = bar;
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setPadding(dp(6), dp(6), dp(6), dp(4));
@@ -303,7 +364,32 @@ public class MainActivity extends Activity {
         root.addView(content, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         homeView = buildHome();
-        setContentView(root);
+
+        FrameLayout outer = new FrameLayout(this);
+        outer.addView(root, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        fab = new TextView(this);
+        fab.setText("⌂");
+        fab.setTextColor(Color.WHITE);
+        fab.setTextSize(20);
+        fab.setGravity(Gravity.CENTER);
+        GradientDrawable fb = new GradientDrawable();
+        fb.setShape(GradientDrawable.OVAL);
+        fb.setColor(Color.parseColor("#B3202020"));
+        fab.setBackground(fb);
+        fab.setAlpha(0.85f);
+        fab.setVisibility(View.GONE);
+        fab.setOnClickListener(v -> showHome());
+        fab.setOnLongClickListener(v -> {
+            barForced = !barForced;
+            applyChrome();
+            return true;
+        });
+        FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(dp(44), dp(44),
+                Gravity.BOTTOM | Gravity.END);
+        flp.setMargins(0, 0, dp(14), dp(90));
+        outer.addView(fab, flp);
+        setContentView(outer);
     }
 
     private View buildHome() {
@@ -325,26 +411,31 @@ public class MainActivity extends Activity {
         sub.setTextSize(13);
         col.addView(sub);
 
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        rowLp.setMargins(0, dp(24), 0, dp(8));
+        LinearLayout row = null;
+        int n = 0;
         for (final String[] s : SITES) {
+            if (n % 2 == 0) {
+                row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                rowLp.setMargins(0, n == 0 ? dp(24) : dp(10), 0, 0);
+                col.addView(row, rowLp);
+            }
+            n++;
             TextView tile = new TextView(this);
             tile.setText(s[0]);
             tile.setTextColor(Color.WHITE);
-            tile.setTextSize(15);
+            tile.setTextSize(17);
             tile.setTypeface(Typeface.DEFAULT_BOLD);
             tile.setGravity(Gravity.CENTER);
             boolean dark = s[0].equals("TikTok");
             tile.setBackground(round(s[2], 18, dark ? "#25F4EE" : null));
             tile.setOnClickListener(v -> openSite(s));
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(100), 1f);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(90), 1f);
             lp.setMargins(dp(5), 0, dp(5), 0);
             row.addView(tile, lp);
         }
-        col.addView(row, rowLp);
 
         TextView tabsTitle = new TextView(this);
         tabsTitle.setText("Taburi deschise");
@@ -417,7 +508,7 @@ public class MainActivity extends Activity {
                 return;
             }
         }
-        newTab(s[1], "1".equals(s[3]));
+        newTab(s[1], "1".equals(s[3]), true);
     }
 
     private boolean sameSite(String a, String b) {
@@ -431,9 +522,14 @@ public class MainActivity extends Activity {
     }
 
     private void newTab(String url, boolean desktop) {
+        newTab(url, desktop, false);
+    }
+
+    private void newTab(String url, boolean desktop, boolean appMode) {
         Tab t = new Tab();
         t.url = url;
         t.desktop = desktop;
+        t.appMode = appMode;
         tabs.add(t);
         switchTo(t);
         saveTabs();
@@ -441,7 +537,7 @@ public class MainActivity extends Activity {
 
     private void switchTo(Tab t) {
         hideKeyboard();
-        if (current != null && current != t && current.wv != null) current.wv.onPause();
+        if (current != null && current != t && current.wv != null && current != mediaTab) current.wv.onPause();
         current = t;
         t.lastUsed = SystemClock.elapsedRealtime();
         if (t.wv == null) {
@@ -457,11 +553,20 @@ public class MainActivity extends Activity {
         urlBar.setText(t.url);
         enforceLimit();
         updateTabsBtn();
+        applyChrome();
+    }
+
+    /** In modul aplicatie ascundem bara de adrese: site-ul arata ca o aplicatie separata. */
+    private void applyChrome() {
+        boolean app = current != null && current.appMode && !barForced;
+        topBar.setVisibility(app ? View.GONE : View.VISIBLE);
+        ramLabel.setVisibility(app ? View.GONE : View.VISIBLE);
+        fab.setVisibility(current != null && current.appMode ? View.VISIBLE : View.GONE);
     }
 
     private void showHome() {
         hideKeyboard();
-        if (current != null && current.wv != null) current.wv.onPause();
+        if (current != null && current.wv != null && current != mediaTab) current.wv.onPause();
         current = null;
         content.removeAllViews();
         content.addView(homeView);
@@ -469,10 +574,13 @@ public class MainActivity extends Activity {
         progress.setVisibility(View.INVISIBLE);
         refreshHomeTabs();
         updateTabsBtn();
+        barForced = false;
+        applyChrome();
     }
 
     private void closeTab(Tab t) {
         boolean wasCurrent = (t == current);
+        if (t == mediaTab) stopMedia();
         sleep(t);
         tabs.remove(t);
         if (wasCurrent) {
@@ -487,6 +595,7 @@ public class MainActivity extends Activity {
     }
 
     private void closeAll() {
+        stopMedia();
         for (Tab t : tabs) sleep(t);
         tabs.clear();
         current = null;
@@ -509,7 +618,7 @@ public class MainActivity extends Activity {
     private void sleepBackgroundTabs() {
         boolean changed = false;
         for (Tab t : tabs) {
-            if (t != current && t.wv != null) {
+            if (t != current && t != mediaTab && t.wv != null) {
                 sleep(t);
                 changed = true;
             }
@@ -530,7 +639,7 @@ public class MainActivity extends Activity {
         while (liveCount() > maxLive) {
             Tab oldest = null;
             for (Tab x : tabs) {
-                if (x.wv != null && x != current && (oldest == null || x.lastUsed < oldest.lastUsed)) oldest = x;
+                if (x.wv != null && x != current && x != mediaTab && (oldest == null || x.lastUsed < oldest.lastUsed)) oldest = x;
             }
             if (oldest == null) break;
             sleep(oldest);
@@ -578,6 +687,7 @@ public class MainActivity extends Activity {
             wv.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, true);
         }
         wv.setBackgroundColor(Color.parseColor(BG));
+        wv.addJavascriptInterface(new MediaBridge(t), "LiteMedia");
 
         wv.setWebViewClient(new WebViewClient() {
             @Override
@@ -598,7 +708,19 @@ public class MainActivity extends Activity {
             }
 
             @Override
+            public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+                // Addon "Blocare reclame": cererea nici nu mai pleaca
+                if (addons.isAdHost(r.getUrl().getHost())) {
+                    addons.blocked.incrementAndGet();
+                    return new WebResourceResponse("text/plain", "utf-8",
+                            new ByteArrayInputStream(new byte[0]));
+                }
+                return null;
+            }
+
+            @Override
             public void onPageStarted(WebView v, String url, Bitmap favicon) {
+                t.injected = false;
                 t.url = url;
                 if (t == current && !urlBar.hasFocus()) urlBar.setText(url);
             }
@@ -609,6 +731,7 @@ public class MainActivity extends Activity {
                 String title = v.getTitle();
                 if (title != null) t.title = title;
                 if (t == current && !urlBar.hasFocus()) urlBar.setText(url);
+                injectAddons(v, t);
                 CookieManager.getInstance().flush();   // salveaza login-ul imediat
             }
 
@@ -619,6 +742,7 @@ public class MainActivity extends Activity {
                 if (v.getParent() != null) ((ViewGroup) v.getParent()).removeView(v);
                 v.destroy();
                 if (t.wv == v) t.wv = null;
+                if (t == mediaTab) stopMedia();
                 if (t == current) {
                     handler.post(() -> {
                         if (current == t && t.wv == null) switchTo(t);
@@ -632,6 +756,8 @@ public class MainActivity extends Activity {
         wv.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onProgressChanged(WebView v, int p) {
+                // aplicam addon-urile devreme, ca sa nu se vada pagina "nemodificata"
+                if (p >= 50 && !t.injected) injectAddons(v, t);
                 if (t != current) return;
                 progress.setProgress(p);
                 progress.setVisibility(p < 100 ? View.VISIBLE : View.INVISIBLE);
@@ -780,6 +906,8 @@ public class MainActivity extends Activity {
             m.add(0, 2, 0, "Mod desktop").setCheckable(true).setChecked(current.desktop);
             m.add(0, 3, 0, "Închide tabul");
         }
+        m.add(0, 9, 0, "Addon-uri");
+        m.add(0, 10, 0, "Player media în fundal").setCheckable(true).setChecked(bgMedia);
         m.add(0, 4, 0, "Rulează cu ecranul stins").setCheckable(true).setChecked(keepAlive);
         Menu sub = m.addSubMenu(0, 5, 0, "Taburi active maxim: " + maxLive);
         for (int n = 1; n <= 4; n++) sub.add(1, 100 + n, 0, n + (n == 1 ? " tab" : " taburi"));
@@ -847,7 +975,16 @@ public class MainActivity extends Activity {
                             + "Login-urile rămân salvate tot timpul, chiar dacă un tab adoarme.")
                     .setPositiveButton("OK", null)
                     .show();
+        } else if (id == 9) {
+            showAddons();
+        } else if (id == 10) {
+            bgMedia = !bgMedia;
+            prefs.edit().putBoolean("bgMedia", bgMedia).apply();
+            if (!bgMedia) stopMedia();
+            toast(bgMedia ? "Playerul media apare când pornește un sunet" : "Player media oprit");
+            reloadForAddons();
         } else if (id == 8) {
+            stopMedia();
             stopService(new Intent(this, KeepAliveService.class));
             keepAlive = false;
             prefs.edit().putBoolean("keepAlive", false).apply();
@@ -872,6 +1009,269 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ------------------------------------------------------------------ addon-uri
+
+    private static final int DLG = android.R.style.Theme_DeviceDefault_Dialog_Alert;
+
+    private void injectAddons(WebView v, Tab t) {
+        t.injected = true;
+        String url = v.getUrl();
+        if (url == null || !url.startsWith("http")) return;
+        if (bgMedia) v.evaluateJavascript(MEDIA_JS, null);
+        String js = addons.injectionFor(Uri.parse(url).getHost());
+        if (js != null) v.evaluateJavascript(js, null);
+    }
+
+    // ------------------------------------------------------------------ player media
+
+    private void onMediaState(Tab t, boolean playing, String title) {
+        if (!bgMedia || !tabs.contains(t)) return;
+        if (playing) {
+            mediaTab = t;
+            sendMedia(title, true);
+        } else if (t == mediaTab && mediaServiceOn) {
+            sendMedia(title, false);
+        }
+    }
+
+    private void sendMedia(String title, boolean playing) {
+        Intent i = new Intent(this, MediaService.class).setAction(MediaService.ACT_UPDATE);
+        i.putExtra("title", title);
+        i.putExtra("playing", playing);
+        String host = mediaTab != null ? Uri.parse(mediaTab.url).getHost() : null;
+        i.putExtra("site", host != null ? strip(host) : "Lite Browser");
+        try {
+            if (Build.VERSION.SDK_INT >= 33
+                    && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 3);
+            }
+            startForegroundService(i);
+            mediaServiceOn = true;
+        } catch (Exception e) {
+            // Android nu permite pornirea din fundal; playerul apare la urmatoarea redare
+        }
+    }
+
+    /** Comenzi venite de la notificare, ecranul de blocare sau casti. */
+    void mediaCommand(String cmd) {
+        if (mediaTab == null || mediaTab.wv == null) {
+            if (!"stop".equals(cmd)) stopMedia();
+            return;
+        }
+        WebView w = mediaTab.wv;
+        w.onResume();
+        w.resumeTimers();
+        if ("toggle".equals(cmd)) {
+            w.evaluateJavascript("window.__lbToggle&&window.__lbToggle()", null);
+        } else if ("play".equals(cmd)) {
+            w.evaluateJavascript("window.__lbPlay&&window.__lbPlay()", null);
+        } else if ("pause".equals(cmd)) {
+            w.evaluateJavascript("window.__lbPause&&window.__lbPause()", null);
+        } else if ("stop".equals(cmd)) {
+            w.evaluateJavascript("window.__lbPause&&window.__lbPause()", null);
+            if (mediaTab != current) w.onPause();
+            mediaTab = null;
+        }
+    }
+
+    private void stopMedia() {
+        if (mediaTab != null && mediaTab.wv != null) {
+            mediaTab.wv.evaluateJavascript("window.__lbPause&&window.__lbPause()", null);
+        }
+        mediaTab = null;
+        if (mediaServiceOn) stopService(new Intent(this, MediaService.class));
+        mediaServiceOn = false;
+    }
+
+    void onMediaServiceStopped() {
+        mediaServiceOn = false;
+    }
+
+    private String typeLabel(AddonManager.Addon a) {
+        if ("block".equals(a.type)) return "blocare";
+        if ("css".equals(a.type)) return "stil";
+        return "script";
+    }
+
+    private void reloadForAddons() {
+        if (current != null && current.wv != null) current.wv.reload();
+    }
+
+    private void showAddons() {
+        final List<AddonManager.Addon> list = addons.list;
+        String[] names = new String[list.size()];
+        boolean[] checked = new boolean[list.size()];
+        for (int i = 0; i < list.size(); i++) {
+            AddonManager.Addon a = list.get(i);
+            String where = "*".equals(a.match.trim()) ? "toate site-urile" : a.match;
+            names[i] = a.name + "\n" + typeLabel(a) + " • " + where;
+            checked[i] = a.enabled;
+        }
+        final AlertDialog d = new AlertDialog.Builder(this, DLG)
+                .setTitle("Addon-uri (ține apăsat pentru opțiuni)")
+                .setMultiChoiceItems(names, checked, (dlg, which, on) -> {
+                    list.get(which).enabled = on;
+                    addons.save();
+                })
+                .setPositiveButton("Gata", (x, y) -> reloadForAddons())
+                .setNegativeButton("Adaugă", (x, y) -> editAddon(null))
+                .setNeutralButton("Importă link", (x, y) -> importAddon())
+                .create();
+        d.show();
+        d.getListView().setOnItemLongClickListener((p, v, pos, id) -> {
+            d.dismiss();
+            addonOptions(list.get(pos));
+            return true;
+        });
+    }
+
+    private void addonOptions(final AddonManager.Addon a) {
+        if (a.builtin) {
+            toast("Addon-urile incluse pot fi doar pornite sau oprite");
+            showAddons();
+            return;
+        }
+        new AlertDialog.Builder(this, DLG)
+                .setTitle(a.name)
+                .setItems(new String[]{"Editează", "Șterge"}, (dlg, which) -> {
+                    if (which == 0) {
+                        editAddon(a);
+                    } else {
+                        addons.list.remove(a);
+                        addons.save();
+                        toast("Addon șters");
+                        reloadForAddons();
+                        showAddons();
+                    }
+                })
+                .setNegativeButton("Înapoi", (x, y) -> showAddons())
+                .show();
+    }
+
+    private void editAddon(final AddonManager.Addon existing) {
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(20), dp(8), dp(20), 0);
+
+        final EditText name = new EditText(this);
+        name.setHint("Nume (ex: Ascunde reclame Instagram)");
+        name.setSingleLine(true);
+        form.addView(name);
+
+        final EditText match = new EditText(this);
+        match.setHint("Site-uri (ex: instagram.com, tiktok.com) sau * pentru toate");
+        match.setSingleLine(true);
+        form.addView(match);
+
+        final android.widget.RadioGroup type = new android.widget.RadioGroup(this);
+        type.setOrientation(LinearLayout.HORIZONTAL);
+        final android.widget.RadioButton js = new android.widget.RadioButton(this);
+        js.setText("Script (JS)");
+        js.setId(View.generateViewId());
+        final android.widget.RadioButton css = new android.widget.RadioButton(this);
+        css.setText("Stil (CSS)");
+        css.setId(View.generateViewId());
+        type.addView(js);
+        type.addView(css);
+        form.addView(type);
+
+        final EditText code = new EditText(this);
+        code.setHint("Codul addon-ului");
+        code.setMinLines(6);
+        code.setMaxLines(12);
+        code.setGravity(Gravity.TOP | Gravity.START);
+        code.setTypeface(Typeface.MONOSPACE);
+        code.setTextSize(12);
+        code.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        form.addView(code);
+
+        if (existing != null) {
+            name.setText(existing.name);
+            match.setText(existing.match);
+            code.setText(existing.code);
+            type.check("css".equals(existing.type) ? css.getId() : js.getId());
+        } else {
+            match.setText(current != null && Uri.parse(current.url).getHost() != null
+                    ? strip(Uri.parse(current.url).getHost()) : "*");
+            type.check(css.getId());
+        }
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(form);
+
+        new AlertDialog.Builder(this, DLG)
+                .setTitle(existing == null ? "Addon nou" : "Editează addon")
+                .setView(sv)
+                .setPositiveButton("Salvează", (dlg, w) -> {
+                    String c = code.getText().toString().trim();
+                    if (c.isEmpty()) {
+                        toast("Codul e gol, addon-ul nu a fost salvat");
+                        return;
+                    }
+                    AddonManager.Addon a = existing;
+                    if (a == null) {
+                        a = new AddonManager.Addon();
+                        a.id = AddonManager.newId();
+                        addons.list.add(a);
+                    }
+                    String n = name.getText().toString().trim();
+                    a.name = n.isEmpty() ? "Addon fără nume" : n;
+                    String m = match.getText().toString().trim();
+                    a.match = m.isEmpty() ? "*" : m;
+                    a.type = type.getCheckedRadioButtonId() == css.getId() ? "css" : "js";
+                    a.code = c;
+                    a.enabled = true;
+                    addons.save();
+                    toast("Addon salvat");
+                    reloadForAddons();
+                })
+                .setNegativeButton("Anulează", (x, y) -> showAddons())
+                .show();
+    }
+
+    private void importAddon() {
+        final EditText url = new EditText(this);
+        url.setHint("https://.../script.user.js sau .css");
+        url.setSingleLine(true);
+        url.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        LinearLayout box = new LinearLayout(this);
+        box.setPadding(dp(20), dp(8), dp(20), 0);
+        box.addView(url, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        new AlertDialog.Builder(this, DLG)
+                .setTitle("Importă addon din link")
+                .setMessage("Pe Greasy Fork apasă butonul „Instalează” și copiază linkul care se termină în .user.js.")
+                .setView(box)
+                .setPositiveButton("Importă", (dlg, w) -> {
+                    final String u = url.getText().toString().trim();
+                    if (!u.startsWith("http")) {
+                        toast("Link invalid");
+                        return;
+                    }
+                    toast("Se descarcă...");
+                    new Thread(() -> {
+                        try {
+                            String text = AddonManager.fetch(u);
+                            final AddonManager.Addon a = AddonManager.fromText(text, u);
+                            runOnUiThread(() -> {
+                                addons.list.add(a);
+                                addons.save();
+                                toast("Addon adăugat: " + a.name);
+                                reloadForAddons();
+                                showAddons();
+                            });
+                        } catch (Exception e) {
+                            runOnUiThread(() -> toast("Nu am putut descărca addon-ul"));
+                        }
+                    }).start();
+                })
+                .setNegativeButton("Anulează", (x, y) -> showAddons())
+                .show();
+    }
+
     // ------------------------------------------------------------------ RAM
 
     private final Runnable ramTicker = new Runnable() {
@@ -887,7 +1287,8 @@ public class MainActivity extends Activity {
             long freeMb = sys.availMem / (1024 * 1024);
 
             ramLabel.setText("Aplicație: " + appMb + " MB  •  Taburi active: " + liveCount() + "/" + maxLive
-                    + "  •  RAM liber: " + freeMb + " MB");
+                    + "  •  RAM liber: " + freeMb + " MB"
+                    + (addons.adblockOn ? "  •  Reclame blocate: " + addons.blocked.get() : ""));
 
             // Telefonul ramane fara RAM: adormim taburile din fundal inainte sa inceapa lag-ul
             if (sys.lowMemory || freeMb < MIN_FREE_PHONE_MB) sleepBackgroundTabs();
@@ -908,6 +1309,7 @@ public class MainActivity extends Activity {
                 o.put("u", u);
                 o.put("t", t.title == null ? "" : t.title);
                 o.put("d", t.desktop);
+                o.put("a", t.appMode);
                 arr.put(o);
             }
             prefs.edit().putString("tabs", arr.toString()).apply();
@@ -924,6 +1326,7 @@ public class MainActivity extends Activity {
                 t.url = o.getString("u");
                 t.title = o.optString("t", "");
                 t.desktop = o.optBoolean("d", false);
+                t.appMode = o.optBoolean("a", false);
                 tabs.add(t);   // pornesc adormite: zero RAM pana le deschizi
             }
         } catch (Exception ignored) {
