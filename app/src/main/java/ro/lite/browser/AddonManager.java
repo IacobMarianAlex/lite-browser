@@ -31,6 +31,7 @@ final class AddonManager {
         String code = "";
         boolean enabled = true;
         boolean builtin = false;
+        boolean adGroup = false;   // merge doar cand blocarea reclamelor e pornita
     }
 
     // Domenii de reclame si trackere des intalnite. Blocate inainte sa se descarce:
@@ -51,14 +52,23 @@ final class AddonManager {
     final AtomicInteger blocked = new AtomicInteger();
     volatile boolean adblockOn = true;
 
-    AddonManager(SharedPreferences prefs) {
+    private final String mfAdblockCode;
+
+    AddonManager(SharedPreferences prefs, String mfAdblockCode) {
         this.prefs = prefs;
+        this.mfAdblockCode = mfAdblockCode == null ? "" : mfAdblockCode;
         load();
+    }
+
+    /** Butonul de pornit/oprit: controleaza blocarea reclamelor si scripturile anti-reclame. */
+    void setAdblock(boolean on) {
+        for (Addon a : list) if ("b_adblock".equals(a.id)) a.enabled = on;
+        save();
     }
 
     // ------------------------------------------------------------------ addon-uri incluse
 
-    private static List<Addon> builtins() {
+    private List<Addon> builtins() {
         List<Addon> b = new ArrayList<>();
 
         Addon ads = new Addon();
@@ -68,6 +78,19 @@ final class AddonManager {
         ads.enabled = true;
         ads.builtin = true;
         b.add(ads);
+
+        if (!mfAdblockCode.isEmpty()) {
+            Addon mf = new Addon();
+            mf.id = "b_mfadblock";
+            mf.name = "mf-adblock (curăță reclamele de pe Fandom)";
+            mf.type = "js";
+            mf.match = "fandom.com";
+            mf.enabled = true;
+            mf.builtin = true;
+            mf.adGroup = true;
+            mf.code = mfAdblockCode;
+            b.add(mf);
+        }
 
         Addon dark = new Addon();
         dark.id = "b_dark";
@@ -194,6 +217,7 @@ final class AddonManager {
         StringBuilder sb = new StringBuilder();
         for (Addon a : list) {
             if (!a.enabled || !matches(a, host) || a.code == null || a.code.isEmpty()) continue;
+            if (a.adGroup && !adblockOn) continue;
             String guard = "__lb_" + a.id.replaceAll("[^A-Za-z0-9_]", "_");
             if ("css".equals(a.type)) {
                 sb.append("(function(){if(document.getElementById('").append(guard).append("'))return;")

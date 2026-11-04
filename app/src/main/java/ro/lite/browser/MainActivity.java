@@ -107,7 +107,10 @@ public class MainActivity extends Activity {
             // pagina crede ca e mereu vizibila, ca sa nu opreasca sunetul cand stingi ecranul
             + "try{Object.defineProperty(document,'hidden',{get:function(){return false;}});"
             + "Object.defineProperty(document,'visibilityState',{get:function(){return 'visible';}});}catch(e){}"
-            + "document.addEventListener('visibilitychange',function(e){e.stopImmediatePropagation();},true);"
+            + "var stop=function(e){e.stopImmediatePropagation();};"
+            + "window.addEventListener('visibilitychange',stop,true);"
+            + "document.addEventListener('visibilitychange',stop,true);"
+            + "try{Object.defineProperty(document,'onvisibilitychange',{set:function(){},get:function(){return null;}});}catch(e){}"
             + "function ttl(){try{var m=navigator.mediaSession&&navigator.mediaSession.metadata;"
             + "if(m&&m.title)return m.title+(m.artist?' – '+m.artist:'');}catch(e){}"
             + "return document.title||location.hostname;}"
@@ -150,7 +153,8 @@ public class MainActivity extends Activity {
     private TextView ramLabel;
     private ProgressBar progress;
     private LinearLayout topBar;
-    private TextView fab;                  // butonul mic din modul aplicatie
+    private TextView fab;
+    private TextView adBtn;                // buton pornit/oprit blocare reclame                  // butonul mic din modul aplicatie
     private boolean barForced = false;     // bara aratata manual in modul aplicatie
 
     private String mobileUA;
@@ -171,7 +175,7 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences("lite", MODE_PRIVATE);
         maxLive = prefs.getInt("maxLive", 3);
         keepAlive = prefs.getBoolean("keepAlive", false);
-        addons = new AddonManager(prefs);
+        addons = new AddonManager(prefs, readRaw(R.raw.mf_adblock));
         bgMedia = prefs.getBoolean("bgMedia", true);
         ref = new java.lang.ref.WeakReference<>(this);
 
@@ -330,6 +334,15 @@ public class MainActivity extends Activity {
             return true;
         });
 
+        adBtn = barButton("🛡");
+        adBtn.setTextSize(16);
+        adBtn.setOnClickListener(v -> toggleAdblock());
+        adBtn.setOnLongClickListener(v -> {
+            toast("Reclame blocate: " + addons.blocked.get());
+            return true;
+        });
+        updateAdBtn();
+
         tabsBtn = barButton("0");
         tabsBtn.setTextSize(15);
         tabsBtn.setTypeface(Typeface.DEFAULT_BOLD);
@@ -344,6 +357,9 @@ public class MainActivity extends Activity {
         bar.addView(urlBar, ulp);
         LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(dp(40), dp(40));
         tlp.setMargins(0, 0, dp(6), 0);
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(dp(40), dp(40));
+        alp.setMargins(0, 0, dp(6), 0);
+        bar.addView(adBtn, alp);
         bar.addView(tabsBtn, tlp);
         bar.addView(menu, new LinearLayout.LayoutParams(dp(40), dp(40)));
         root.addView(bar);
@@ -664,7 +680,9 @@ public class MainActivity extends Activity {
     // ------------------------------------------------------------------ WebView
 
     private WebView createWebView(final Tab t) {
-        final WebView wv = new WebView(this);
+        final MediaWebView wv = new MediaWebView(this);
+        // cat timp tabul reda sunet, nu il lasam sa afle ca ecranul s-a stins
+        wv.keepPlaying = () -> bgMedia && t == mediaTab;
         WebSettings s = wv.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);          // necesar pentru login-uri (Instagram, TikTok)
@@ -721,6 +739,7 @@ public class MainActivity extends Activity {
             @Override
             public void onPageStarted(WebView v, String url, Bitmap favicon) {
                 t.injected = false;
+                if (bgMedia) v.evaluateJavascript(MEDIA_JS, null);
                 t.url = url;
                 if (t == current && !urlBar.hasFocus()) urlBar.setText(url);
             }
@@ -906,6 +925,7 @@ public class MainActivity extends Activity {
             m.add(0, 2, 0, "Mod desktop").setCheckable(true).setChecked(current.desktop);
             m.add(0, 3, 0, "Închide tabul");
         }
+        m.add(0, 11, 0, "Blocare reclame").setCheckable(true).setChecked(addons.adblockOn);
         m.add(0, 9, 0, "Addon-uri");
         m.add(0, 10, 0, "Player media în fundal").setCheckable(true).setChecked(bgMedia);
         m.add(0, 4, 0, "Rulează cu ecranul stins").setCheckable(true).setChecked(keepAlive);
@@ -975,6 +995,8 @@ public class MainActivity extends Activity {
                             + "Login-urile rămân salvate tot timpul, chiar dacă un tab adoarme.")
                     .setPositiveButton("OK", null)
                     .show();
+        } else if (id == 11) {
+            toggleAdblock();
         } else if (id == 9) {
             showAddons();
         } else if (id == 10) {
@@ -1088,6 +1110,22 @@ public class MainActivity extends Activity {
         mediaServiceOn = false;
     }
 
+    private void toggleAdblock() {
+        addons.setAdblock(!addons.adblockOn);
+        updateAdBtn();
+        toast(addons.adblockOn ? "Blocare reclame: PORNITĂ" : "Blocare reclame: OPRITĂ");
+        reloadForAddons();
+    }
+
+    private void updateAdBtn() {
+        if (adBtn == null) return;
+        GradientDrawable g = new GradientDrawable();
+        g.setCornerRadius(dp(12));
+        g.setColor(Color.parseColor(addons.adblockOn ? "#1B5E20" : "#2A2A2A"));
+        adBtn.setBackground(g);
+        adBtn.setAlpha(addons.adblockOn ? 1f : 0.5f);
+    }
+
     private String typeLabel(AddonManager.Addon a) {
         if ("block".equals(a.type)) return "blocare";
         if ("css".equals(a.type)) return "stil";
@@ -1114,7 +1152,10 @@ public class MainActivity extends Activity {
                     list.get(which).enabled = on;
                     addons.save();
                 })
-                .setPositiveButton("Gata", (x, y) -> reloadForAddons())
+                .setPositiveButton("Gata", (x, y) -> {
+                    updateAdBtn();
+                    reloadForAddons();
+                })
                 .setNegativeButton("Adaugă", (x, y) -> editAddon(null))
                 .setNeutralButton("Importă link", (x, y) -> importAddon())
                 .create();
@@ -1334,6 +1375,18 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------ utilitare
+
+    private String readRaw(int id) {
+        try (java.io.InputStream in = getResources().openRawResource(id)) {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            byte[] b = new byte[8192];
+            int n;
+            while ((n = in.read(b)) > 0) out.write(b, 0, n);
+            return out.toString("UTF-8");
+        } catch (Exception e) {
+            return "";
+        }
+    }
 
     private static String chromeVersion(String ua) {
         Matcher m = Pattern.compile("Chrome/([\\d.]+)").matcher(ua);
