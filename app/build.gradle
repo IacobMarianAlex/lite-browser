@@ -10,8 +10,8 @@ android {
         applicationId 'ro.lite.browser'
         minSdk 26
         targetSdk 34
-        versionCode 4
-        versionName '1.3'
+        versionCode 5
+        versionName '1.4'
     }
 
     signingConfigs {
@@ -30,6 +30,13 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
             // cheie fixa: actualizarile se instaleaza peste versiunea veche, fara sa pierzi login-urile
             signingConfig signingConfigs.lite
+        }
+    }
+
+    // APK-ul primeste numele si versiunea, ca sa nu se mai confunde fisierele
+    applicationVariants.all { variant ->
+        variant.outputs.all {
+            outputFileName = "LiteBrowser-v${variant.versionName}.apk"
         }
     }
 

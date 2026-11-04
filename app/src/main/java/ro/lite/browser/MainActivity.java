@@ -175,7 +175,7 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences("lite", MODE_PRIVATE);
         maxLive = prefs.getInt("maxLive", 3);
         keepAlive = prefs.getBoolean("keepAlive", false);
-        addons = new AddonManager(prefs, readRaw(R.raw.mf_adblock));
+        addons = new AddonManager(prefs, readRaw(R.raw.mf_adblock), readRaw(R.raw.yt_skip));
         bgMedia = prefs.getBoolean("bgMedia", true);
         ref = new java.lang.ref.WeakReference<>(this);
 
@@ -728,7 +728,7 @@ public class MainActivity extends Activity {
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
                 // Addon "Blocare reclame": cererea nici nu mai pleaca
-                if (addons.isAdHost(r.getUrl().getHost())) {
+                if (addons.isAdUrl(r.getUrl())) {
                     addons.blocked.incrementAndGet();
                     return new WebResourceResponse("text/plain", "utf-8",
                             new ByteArrayInputStream(new byte[0]));

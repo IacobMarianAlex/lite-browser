@@ -53,10 +53,12 @@ final class AddonManager {
     volatile boolean adblockOn = true;
 
     private final String mfAdblockCode;
+    private final String ytSkipCode;
 
-    AddonManager(SharedPreferences prefs, String mfAdblockCode) {
+    AddonManager(SharedPreferences prefs, String mfAdblockCode, String ytSkipCode) {
         this.prefs = prefs;
         this.mfAdblockCode = mfAdblockCode == null ? "" : mfAdblockCode;
+        this.ytSkipCode = ytSkipCode == null ? "" : ytSkipCode;
         load();
     }
 
@@ -78,6 +80,19 @@ final class AddonManager {
         ads.enabled = true;
         ads.builtin = true;
         b.add(ads);
+
+        if (!ytSkipCode.isEmpty()) {
+            Addon yt = new Addon();
+            yt.id = "b_ytskip";
+            yt.name = "YouTube: sare peste reclame";
+            yt.type = "js";
+            yt.match = "youtube.com";
+            yt.enabled = true;
+            yt.builtin = true;
+            yt.adGroup = true;
+            yt.code = ytSkipCode;
+            b.add(yt);
+        }
 
         if (!mfAdblockCode.isEmpty()) {
             Addon mf = new Addon();
@@ -190,6 +205,20 @@ final class AddonManager {
     }
 
     // ------------------------------------------------------------------ aplicare pe pagini
+
+    /** Blocheaza si adresele de reclame/statistici de reclame de pe site-uri mari (ex. YouTube). */
+    boolean isAdUrl(android.net.Uri u) {
+        if (!adblockOn || u == null) return false;
+        if (isAdHost(u.getHost())) return true;
+        String path = u.getPath();
+        if (path == null) return false;
+        String h = u.getHost() == null ? "" : u.getHost();
+        if (h.endsWith("youtube.com")) {
+            return path.startsWith("/pagead/") || path.startsWith("/api/stats/ads")
+                    || path.startsWith("/ptracking") || path.contains("/get_midroll_");
+        }
+        return path.startsWith("/pagead/");
+    }
 
     boolean isAdHost(String host) {
         if (!adblockOn || host == null) return false;
